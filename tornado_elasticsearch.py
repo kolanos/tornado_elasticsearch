@@ -19,12 +19,14 @@ on how to use the API beyond the introduction for how to use with Tornado::
             self.finish(info)
 
 """
+from itertools import chain
 from elasticsearch.connection.base import Connection
 from elasticsearch.exceptions import ConnectionError, \
     HTTP_EXCEPTIONS, \
-    NotFoundError
+    NotFoundError, \
+    SerializationError
 from elasticsearch.client import Elasticsearch
-from elasticsearch.transport import Transport, TransportError
+from elasticsearch.transport import ADDRESS_RE, Transport, TransportError
 from elasticsearch.client.utils import query_params, _make_path
 
 from tornado import concurrent
@@ -132,6 +134,60 @@ class AsyncHttpConnection(Connection):
         if params:
             uri = '%s?%s' % (uri, urlencode(params or {}))
         return '%s%s' % (self.base_url, uri)
+
+    @gen.coroutine
+    def sniff_hosts(self, initial=False):
+        """
+        Obtain a list of nodes from the cluster and create a new connection
+        pool using the information retrieved.
+
+        To extract the node connection parameters use the ``nodes_to_host_callback``.
+
+        :arg initial: flag indicating if this is during startup
+            (``sniff_on_start``), ignore the ``sniff_timeout`` if ``True``
+        """
+        previous_sniff = self.last_sniff
+        try:
+            # reset last_sniff timestamp
+            self.last_sniff = time.time()
+            # go through all current connections as well as the
+            # seed_connections for good measure
+            for c in chain(self.connection_pool.connections, self.seed_connections):
+                try:
+                    # use small timeout for the sniffing request, should be a fast api call
+                    _, headers, node_info = yield c.perform_request('GET', '/_nodes/_all/clear',
+                        timeout=self.sniff_timeout if not initial else None)
+                    node_info = self.deserializer.loads(node_info, headers.get('content-type'))
+                    break
+                except (ConnectionError, SerializationError):
+                    pass
+            else:
+                raise TransportError("N/A", "Unable to sniff hosts.")
+        except:
+            # keep the previous value on error
+            self.last_sniff = previous_sniff
+            raise
+
+        hosts = []
+        address = self.connection_class.transport_schema + '_address'
+        for n in node_info['nodes'].values():
+            match = ADDRESS_RE.search(n.get(address, ''))
+            if not match:
+                continue
+
+            host = match.groupdict()
+            if 'port' in host:
+                host['port'] = int(host['port'])
+            host = self.host_info_callback(n, host)
+            if host is not None:
+                hosts.append(host)
+
+        # we weren't able to get any nodes, maybe using an incompatible
+        # transport_schema or host_info_callback blocked all - raise error.
+        if not hosts:
+            raise TransportError("N/A", "Unable to sniff hosts - no viable hosts found.")
+
+        self.set_connections(hosts)
 
 
 class AsyncTransport(Transport):
